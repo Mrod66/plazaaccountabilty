@@ -1,0 +1,716 @@
+// The Site Database's schema (Prisma ORM 7). Change it, then run
+// `npx prisma migrate dev --create-only --name <what-changed>` against the
+// Preview Database, wrap the new migration.sql in BEGIN; … COMMIT;, apply it
+// with `npx prisma migrate dev`, then `npx prisma generate` (docs/agent/database.md).
+//
+// Tables marked MANAGED belong to the template's auth core (src/platform/auth):
+// add columns to them only through a template upgrade.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+  // The client runs in the Cloudflare Workers runtime, never in Node.
+  runtime  = "workerd"
+}
+
+// TESTS ONLY: the same client for Node, so `npm test` can run the real Site API
+// against a real Postgres (vitest aliases the import to it). Never imported by
+// site code; git-ignored like the one above.
+generator nodeClient {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma-node"
+  runtime  = "nodejs"
+}
+
+// The connection string is NOT here: prisma.config.ts reads DATABASE_URL from
+// the environment, which the platform sets (the Build never gets one).
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------- auth (MANAGED)
+
+/// A person with an account on this site. `email` is stored trimmed and
+/// lower-cased. Only the user and holders of `site:user:read` ever see it.
+model User {
+  id                Int       @id @default(autoincrement())
+  email             String    @unique @db.VarChar(254)
+  /// `pbkdf2-sha256$v1$<iterations>$<salt>$<key>` (src/platform/auth/password.ts).
+  passwordHash      String    @map("password_hash") @db.VarChar(255)
+  name              String    @db.VarChar(80)
+  /// `active` or `suspended`.
+  status            String    @default("active") @db.VarChar(16)
+  emailVerifiedAt   DateTime? @map("email_verified_at")
+  /// Bumped on password change, logout-all and suspension: every access token
+  /// carrying an older value stops working at once.
+  sessionVersion    Int       @default(1) @map("session_version")
+  lastLoginAt       DateTime? @map("last_login_at")
+  /// Two-step sign-in (src/platform/auth/two-factor.ts): the authenticator secret, SEALED
+  /// (never in clear), set once the user confirmed a first code (`totpEnabledAt`).
+  totpSecretSealed  String?   @map("totp_secret_sealed") @db.VarChar(255)
+  /// A secret shown during setup, not yet confirmed with a code.
+  totpPendingSealed String?   @map("totp_pending_sealed") @db.VarChar(255)
+  totpEnabledAt     DateTime? @map("totp_enabled_at")
+  /// The 30-second step of the last accepted code: that code (and older) never works again.
+  totpLastStep      Int?      @map("totp_last_step")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  roles              UserRole[]
+  refreshTokens      RefreshToken[]
+  passwordResets     PasswordReset[]
+  emailVerifications EmailVerification[]
+  emailChanges       EmailChange[]
+  recoveryCodes      RecoveryCode[]
+  signInCodes        SignInCode[]
+
+  @@index([status, id])
+  @@map("users")
+}
+
+/// A role: a named set of permissions. `is_system` roles (owner, admin,
+/// member) are seeded and cannot be deleted; `owner` cannot be edited.
+model Role {
+  id          Int      @id @default(autoincrement())
+  slug        String   @unique @db.VarChar(48)
+  name        String   @db.VarChar(80)
+  description String?  @db.VarChar(255)
+  isSystem    Boolean  @default(false) @map("is_system")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  permissions RolePermission[]
+  users       UserRole[]
+
+  @@map("roles")
+}
+
+/// The permission catalogue: one row per codename (`site:job:manage`,
+/// `site:user:*`, `*`). Shipped as idempotent migrations, matched by codename.
+model Permission {
+  id          Int      @id @default(autoincrement())
+  codename    String   @unique @db.VarChar(128)
+  title       String   @db.VarChar(120)
+  description String?  @db.VarChar(255)
+  /// Groups the catalogue in the roles screen ("Users", "Jobs").
+  groupName   String   @default("General") @map("group_name") @db.VarChar(48)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  roles RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       Int      @map("role_id")
+  permissionId Int      @map("permission_id")
+  grantedBy    Int?     @map("granted_by")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+model UserRole {
+  userId    Int      @map("user_id")
+  roleId    Int      @map("role_id")
+  grantedBy Int?     @map("granted_by")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@index([roleId, userId])
+  @@map("user_roles")
+}
+
+/// One refresh token, stored only as its SHA-256. Tokens of one sign-in share
+/// a `family_id`; each rotation marks the old row used and points the new
+/// row at it (`rotated_from`). Reuse of a used token revokes the family.
+model RefreshToken {
+  id                BigInt    @id @default(autoincrement())
+  familyId          String    @map("family_id") @db.Uuid
+  userId            Int       @map("user_id")
+  tokenHash         String    @unique @map("token_hash") @db.Char(64)
+  rotatedFromId     BigInt?   @map("rotated_from")
+  usedAt            DateTime? @map("used_at")
+  revokedAt         DateTime? @map("revoked_at")
+  revokedReason     String?   @map("revoked_reason") @db.VarChar(16)
+  expiresAt         DateTime  @map("expires_at")
+  absoluteExpiresAt DateTime  @map("absolute_expires_at")
+  userAgent         String?   @map("user_agent") @db.VarChar(255)
+  ipHash            String?   @map("ip_hash") @db.Char(64)
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([familyId])
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+/// A single-use password reset link (30 minutes), stored as its SHA-256.
+model PasswordReset {
+  id        Int       @id @default(autoincrement())
+  userId    Int       @map("user_id")
+  tokenHash String    @unique @map("token_hash") @db.Char(64)
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  ipHash    String?   @map("ip_hash") @db.Char(64)
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
+  @@map("password_resets")
+}
+
+/// A single-use email confirmation link (24 hours), stored as its SHA-256.
+model EmailVerification {
+  id        Int       @id @default(autoincrement())
+  userId    Int       @map("user_id")
+  /// The address this link confirms (the user's email when it was sent).
+  email     String    @db.VarChar(254)
+  tokenHash String    @unique @map("token_hash") @db.Char(64)
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
+  @@map("email_verifications")
+}
+
+/// A 6-digit sign-in code emailed to the account (src/platform/auth/code-routes.ts): 10 minutes,
+/// single use, 5 wrong tries and it is spent. Only its keyed hash is stored. A new code ends the
+/// older ones.
+model SignInCode {
+  id        Int       @id @default(autoincrement())
+  userId    Int       @map("user_id")
+  codeHash  String    @map("code_hash") @db.Char(64)
+  tries     Int       @default(0)
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  ipHash    String?   @map("ip_hash") @db.Char(64)
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
+  @@map("sign_in_codes")
+}
+
+/// Rate-limit ledger: one row per attempt. Keyed hashes only (never the raw
+/// email or IP). Rows older than a day are swept on the way.
+model LoginAttempt {
+  id        BigInt   @id @default(autoincrement())
+  /// `login`, `register`, `reset`, `verify`, `password`, `code`, `codecheck`, ….
+  kind      String   @db.VarChar(16)
+  emailHash String?  @map("email_hash") @db.Char(64)
+  ipHash    String   @map("ip_hash") @db.Char(64)
+  succeeded Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([kind, emailHash, createdAt])
+  @@index([kind, ipHash, createdAt])
+  @@index([createdAt])
+  @@map("login_attempts")
+}
+
+/// Security-relevant events (sign-ups, password changes, role changes,
+/// refresh-token reuse). No email addresses, no raw IPs, no secrets.
+/// A pending move of an account to a new address: the link mailed to the NEW address
+/// (`/account/confirm-email/?token=…`) finishes it; single use, 24 hours.
+model EmailChange {
+  id        Int       @id @default(autoincrement())
+  userId    Int       @map("user_id")
+  newEmail  String    @map("new_email") @db.VarChar(254)
+  tokenHash String    @unique @map("token_hash") @db.Char(64)
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([expiresAt])
+  @@map("email_changes")
+}
+
+/// Two-step sign-in recovery codes, as SHA-256 hashes; each works once.
+model RecoveryCode {
+  id        Int       @id @default(autoincrement())
+  userId    Int       @map("user_id")
+  codeHash  String    @map("code_hash") @db.Char(64)
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, codeHash])
+  @@map("recovery_codes")
+}
+
+model AuditEvent {
+  id          BigInt   @id @default(autoincrement())
+  actorUserId Int?     @map("actor_user_id")
+  action      String   @db.VarChar(64)
+  targetType  String?  @map("target_type") @db.VarChar(32)
+  targetId    String?  @map("target_id") @db.VarChar(64)
+  ipHash      String?  @map("ip_hash") @db.Char(64)
+  /// Small, non-personal details (`{"roles":["admin"]}`). Never filtered on.
+  meta        Json?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([actorUserId, id])
+  @@index([targetType, targetId, id])
+  @@map("audit_events")
+}
+
+/// One row (`id = 1`): who claimed the owner role first. Claimed with a
+/// conditional update, so two simultaneous sign-ups can never both become owner.
+model AuthState {
+  id          Int      @id
+  ownerUserId Int?     @map("owner_user_id")
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("auth_state")
+}
+
+/// Background job deliveries already taken (`src/platform/background.ts`): the
+/// replay guard for signed deliveries, across every Worker instance. One row
+/// per job try; rows older than a day are swept on the way.
+model JobDelivery {
+  jobId   String   @map("job_id")
+  attempt Int
+  seenAt  DateTime @default(now()) @map("seen_at")
+
+  @@id([jobId, attempt])
+  @@index([seenAt])
+  @@map("job_deliveries")
+}
+
+// ---------------------------------------------------------------- the site's own data
+
+/// A job on the job board (`/jobs`, `/jobs/<slug>`). Holders of
+/// `site:job:manage` post and edit them from `/portal/jobs`.
+model Job {
+  id          Int      @id @default(autoincrement())
+  /// URL name, unique: `/jobs/<slug>`.
+  slug        String   @unique @db.VarChar(120)
+  title       String   @db.VarChar(120)
+  company     String   @db.VarChar(80)
+  location    String   @db.VarChar(80)
+  /// `full-time`, `part-time`, `contract` or `internship`.
+  type        String   @default("full-time") @db.VarChar(20)
+  remote      Boolean  @default(false)
+  /// Plain text; paragraphs separated by blank lines.
+  description String   @db.VarChar(10000)
+  /// Where to apply: an https URL or a mailto: link the poster chose to publish.
+  applyUrl    String   @map("apply_url") @db.VarChar(500)
+  /// `open` (listed) or `closed` (kept, not listed).
+  status      String   @default("open") @db.VarChar(10)
+  /// The user (`users.id`) who posted it. No foreign key: a job outlives its poster.
+  createdBy   Int      @map("created_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@index([status, id])
+  @@map("jobs")
+}
+
+// ---------------------------------------------------------------- Plaza Accountability Hub
+
+/// A dealer group. Every hub row belongs to exactly one; nothing is ever read
+/// across organizations (src/server/hub/context.ts adds `orgId` to every query).
+model Organization {
+  id        Int      @id @default(autoincrement())
+  slug      String   @unique @db.VarChar(48)
+  name      String   @db.VarChar(120)
+  /// IANA time zone every time in this organization is shown in.
+  timeZone  String   @default("America/New_York") @map("time_zone") @db.VarChar(48)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  stores Store[]
+  staff  Staff[]
+
+  @@map("organizations")
+}
+
+/// One rooftop (Plaza Honda, Plaza Used Cars…).
+model Store {
+  id           Int      @id @default(autoincrement())
+  orgId        Int      @map("org_id")
+  name         String   @db.VarChar(80)
+  /// Short label for chips and tables ("Honda", "Used Cars").
+  shortName    String   @map("short_name") @db.VarChar(32)
+  /// Shown on CSI cases ("Honda", or "Used" for a used-car store).
+  manufacturer String   @db.VarChar(32)
+  hasService   Boolean  @default(true) @map("has_service")
+  address      String?  @db.VarChar(200)
+  sortOrder    Int      @default(0) @map("sort_order")
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  org    Organization    @relation(fields: [orgId], references: [id])
+  staff  StaffStore[]
+  routes StoreRoute[]
+  hours  BusinessHours[]
+
+  @@index([orgId, sortOrder])
+  @@map("stores")
+}
+
+/// A person's place in an organization. `userId` is `users.id` (the account,
+/// its name, email and roles live there). Deactivating = the account's status.
+model Staff {
+  userId        Int      @id @map("user_id")
+  orgId         Int      @map("org_id")
+  firstName     String   @map("first_name") @db.VarChar(40)
+  lastName      String   @map("last_name") @db.VarChar(40)
+  /// `sales`, `service` or `group` (leadership, admin).
+  department    String   @default("sales") @db.VarChar(16)
+  /// Their manager's `users.id`, for escalations. No FK: people come and go.
+  managerUserId Int?     @map("manager_user_id")
+  /// `batched` (alerts by email during the day) or `summary` (8:00 AM and 4:00 PM only).
+  alertMode     String   @default("batched") @map("alert_mode") @db.VarChar(10)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  org    Organization @relation(fields: [orgId], references: [id])
+  stores StaffStore[]
+
+  @@index([orgId, lastName, firstName])
+  @@map("staff")
+}
+
+/// Which stores a person belongs to (salespeople, managers, advisors). Group
+/// teams (BDC, CSI) usually have none.
+model StaffStore {
+  userId  Int @map("user_id")
+  storeId Int @map("store_id")
+
+  staff Staff @relation(fields: [userId], references: [userId], onDelete: Cascade)
+  store Store @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@id([userId, storeId])
+  @@index([storeId, userId])
+  @@map("staff_stores")
+}
+
+/// Who a new case goes to by default: one person per store and kind
+/// (`hot_bdc`, `hot_sales`, `csi_sales`, `csi_service`). Admin edits these.
+model StoreRoute {
+  storeId   Int      @map("store_id")
+  kind      String   @db.VarChar(16)
+  userId    Int      @map("user_id")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  store Store @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@id([storeId, kind])
+  @@map("store_routes")
+}
+
+/// The next case number per organization and type (HP-1001, CSI-2001…),
+/// taken with one atomic UPDATE … RETURNING.
+model CaseCounter {
+  orgId Int    @map("org_id")
+  type  String @db.VarChar(8)
+  next  Int
+
+  @@id([orgId, type])
+  @@map("case_counters")
+}
+
+/// A case: a Hot Prospect (`type = 'hot'`) or a CSI Recovery (`type = 'csi'`).
+/// One current owner, always (`ownerId`); `acceptedAt` null = not accepted yet.
+/// Never deleted. Every change also writes a `case_events` row.
+model Case {
+  id         Int    @id @default(autoincrement())
+  orgId      Int    @map("org_id")
+  /// `HP-1042`, `CSI-2210`: unique in the organization.
+  number     String @db.VarChar(16)
+  type       String @db.VarChar(8)
+  storeId    Int    @map("store_id")
+  /// `sales` or `service`.
+  department String @db.VarChar(16)
+  /// Hot: new, accepted, contacted, working, closed. CSI: new, accepted, called, fixing, closed.
+  status     String @default("new") @db.VarChar(16)
+
+  customerName  String  @map("customer_name") @db.VarChar(80)
+  /// Digits only (`7185551234`).
+  phone         String  @db.VarChar(15)
+  customerEmail String? @map("customer_email") @db.VarChar(254)
+  /// "What the customer said" (Hot) / "Customer's words" (CSI).
+  customerWords String  @map("customer_words") @db.VarChar(300)
+
+  createdById     Int       @map("created_by")
+  /// The creator's team when they created it: sales_bdc, sales, csi, service_bdc, manager.
+  createdTeam     String    @map("created_team") @db.VarChar(16)
+  ownerId         Int       @map("owner_id")
+  /// When the current owner got it (created or handed off).
+  ownerSince      DateTime  @default(now()) @map("owner_since")
+  acceptedAt      DateTime? @map("accepted_at")
+  /// First logged contact with the customer (Hot) / first manager call (CSI):
+  /// any attempt, reached or not (it meets the contact clock).
+  firstContactAt  DateTime? @map("first_contact_at")
+  /// First logged contact that actually REACHED the customer (null = attempted only, or none).
+  reachedAt       DateTime? @map("reached_at")
+  /// Business minutes (store hours, like the clocks) from opening to `firstContactAt`.
+  firstContactMin Int?      @map("first_contact_min")
+
+  // Hot Prospect
+  source           String?   @db.VarChar(16)
+  vehicleYear      Int?      @map("vehicle_year") @db.SmallInt
+  vehicleMake      String?   @map("vehicle_make") @db.VarChar(40)
+  vehicleModel     String?   @map("vehicle_model") @db.VarChar(60)
+  /// `new` or `used`.
+  vehicleCondition String?   @map("vehicle_condition") @db.VarChar(8)
+  stockNumber      String?   @map("stock_number") @db.VarChar(20)
+  hasTrade         Boolean   @default(false) @map("has_trade")
+  tradeYear        Int?      @map("trade_year") @db.SmallInt
+  tradeMake        String?   @map("trade_make") @db.VarChar(40)
+  tradeModel       String?   @map("trade_model") @db.VarChar(60)
+  tradeMiles       Int?      @map("trade_miles")
+  reason           String?   @db.VarChar(24)
+  /// `now`, `today` or `by_time` (then `callbackAt`).
+  urgency          String?   @db.VarChar(8)
+  callbackAt       DateTime? @map("callback_at")
+
+  // CSI Recovery
+  manufacturer    String?   @db.VarChar(32)
+  /// Deal # (sales delivery) or RO # (service visit).
+  refNumber       String?   @map("ref_number") @db.VarChar(20)
+  /// Delivery date or RO close date (a calendar date).
+  eventDate       DateTime? @map("event_date") @db.Date
+  /// The salesperson or service advisor involved (`users.id`).
+  staffInvolvedId Int?      @map("staff_involved_id")
+  /// `pre_survey` or `survey_received`.
+  stage           String?   @db.VarChar(16)
+  /// `happy`, `neutral`, `unhappy`, `no_reach`.
+  sentiment       String?   @db.VarChar(10)
+  surveyScore     String?   @map("survey_score") @db.VarChar(20)
+  /// Problem codes (`wait_time`, `price_fees`…).
+  problems        String[]  @default([]) @db.VarChar(24)
+
+  // Outcome
+  /// Hot: appointment, sold, lost. CSI: recovered, partly, not_recovered, no_reach, no_issue.
+  outcome       String?   @db.VarChar(16)
+  outcomeNote   String?   @map("outcome_note") @db.VarChar(1000)
+  appointmentAt DateTime? @map("appointment_at")
+  lostReason    String?   @map("lost_reason") @db.VarChar(24)
+  /// "Still working, follow-up set": the next follow-up (the case stays open).
+  followUpAt    DateTime? @map("follow_up_at")
+  /// After an appointment: `yes`, `no`, `rescheduled`.
+  showed        String?   @db.VarChar(12)
+  /// After a CSI case: `good`, `bad`, `not_returned`, `unknown`.
+  finalSurvey   String?   @map("final_survey") @db.VarChar(12)
+  closedAt      DateTime? @map("closed_at")
+
+  /// Bumped on every change: a save made on an older version is refused (409).
+  version   Int      @default(1)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  participants CaseParticipant[]
+  events       CaseEvent[]
+  clocks       CaseClock[]
+
+  @@unique([orgId, number])
+  @@index([ownerId, status])
+  @@index([createdById, id])
+  @@index([orgId, id])
+  @@index([orgId, type, storeId, id])
+  @@index([orgId, phone, createdAt])
+  @@index([firstContactMin, firstContactAt])
+  @@map("cases")
+}
+
+/// Everyone who may see a case because they took part in it: its creator and
+/// every owner it has had. "Sees only cases they created or are assigned to"
+/// is an EXISTS on this table, enforced in every case query.
+model CaseParticipant {
+  caseId Int @map("case_id")
+  userId Int @map("user_id")
+
+  case Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@id([caseId, userId])
+  @@index([userId, caseId])
+  @@map("case_participants")
+}
+
+/// The case history: one line per action, never edited or deleted.
+model CaseEvent {
+  id         BigInt    @id @default(autoincrement())
+  caseId     Int       @map("case_id")
+  /// `users.id` of who did it.
+  actorId    Int       @map("actor_id")
+  /// created, accepted, handed_off, contacted, note, status, outcome, follow_up,
+  /// reopened, showed, final_survey, reassigned.
+  kind       String    @db.VarChar(16)
+  fromUserId Int?      @map("from_user_id")
+  toUserId   Int?      @map("to_user_id")
+  fromStatus String?   @map("from_status") @db.VarChar(16)
+  toStatus   String?   @map("to_status") @db.VarChar(16)
+  /// Contact method: call, text, email.
+  method     String?   @db.VarChar(8)
+  /// Contact result, outcome code, showed/final survey value.
+  result     String?   @db.VarChar(24)
+  note       String?   @db.VarChar(1000)
+  /// A date the event set (appointment, follow-up).
+  at         DateTime?
+  /// `contacted` only: business minutes from when the actor got the case to this contact.
+  elapsedMin Int?      @map("elapsed_min")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  case Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@index([caseId, id])
+  @@index([kind, elapsedMin])
+  @@map("case_events")
+}
+
+/// When a store's department is open (Eastern time): one row per open weekday
+/// (0 = Sunday). No row = closed that day. Case clocks only run while open.
+model BusinessHours {
+  storeId    Int    @map("store_id")
+  /// `sales` or `service`.
+  department String @db.VarChar(16)
+  weekday    Int    @db.SmallInt
+  /// Minutes after midnight: 540 = 9:00 AM.
+  openMin    Int    @map("open_min") @db.SmallInt
+  closeMin   Int    @map("close_min") @db.SmallInt
+
+  store Store @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@id([storeId, department, weekday])
+  @@map("business_hours")
+}
+
+/// How long each clock gives, per organization and case type. `kind`: accept,
+/// contact, close (the three clocks), escalate (after a miss, before the
+/// manager hears), overdue (after a miss, before the Overdue panel).
+model ClockSetting {
+  orgId    Int    @map("org_id")
+  caseType String @map("case_type") @db.VarChar(8)
+  kind     String @db.VarChar(10)
+  amount   Int
+  /// `minutes`, `hours` (business time) or `days` (business days).
+  unit     String @db.VarChar(8)
+
+  @@id([orgId, caseType, kind])
+  @@map("clock_settings")
+}
+
+/// One clock on a case: accept (one per owner who must accept), contact, close.
+/// Its result is kept forever: met, or missed (and when it was done late).
+model CaseClock {
+  id          Int       @id @default(autoincrement())
+  caseId      Int       @map("case_id")
+  /// accept, contact, close.
+  kind        String    @db.VarChar(10)
+  /// Who must act (the case's owner; follows hand-offs for contact and close).
+  ownerId     Int       @map("owner_id")
+  startedAt   DateTime  @map("started_at")
+  dueAt       DateTime  @map("due_at")
+  /// running, met, missed. A stopped clock that was never missed is `met`.
+  status      String    @default("running") @db.VarChar(10)
+  /// When what the clock waited for happened (also after a miss).
+  doneAt      DateTime? @map("done_at")
+  missedAt    DateTime? @map("missed_at")
+  /// When the owner's manager hears, if it is still not done.
+  escalateAt  DateTime? @map("escalate_at")
+  escalatedAt DateTime? @map("escalated_at")
+  escalatedTo Int?      @map("escalated_to")
+  /// From then on the case is on the Director of Operations' Overdue panel.
+  overdueAt   DateTime? @map("overdue_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  case Case @relation(fields: [caseId], references: [id], onDelete: Cascade)
+
+  @@index([caseId, kind])
+  @@index([status, dueAt])
+  @@index([status, escalateAt])
+  @@index([status, overdueAt])
+  @@map("case_clocks")
+}
+
+/// An in-app alert: the official record of what is waiting on someone. Email is
+/// only a nudge about these, sent in batches (src/server/hub/alerts.ts).
+model Notification {
+  id         BigInt    @id @default(autoincrement())
+  orgId      Int       @map("org_id")
+  userId     Int       @map("user_id")
+  caseId     Int       @map("case_id")
+  /// assigned, handed_off, clock_missed, escalation, reopened.
+  kind       String    @db.VarChar(16)
+  /// What the alert says ("Accept clock missed").
+  message    String    @db.VarChar(200)
+  /// Makes the same alert impossible twice (`missed:<clockId>`).
+  dedupeKey  String?   @unique @map("dedupe_key") @db.VarChar(64)
+  /// Escalations travel in their own email batch and are never dropped.
+  escalation Boolean   @default(false)
+  readAt     DateTime? @map("read_at")
+  /// pending (waiting for the next batch), sent, capped (a sending limit blocked it), none.
+  emailState String    @default("pending") @map("email_state") @db.VarChar(10)
+  emailedAt  DateTime? @map("emailed_at")
+  /// The first time a sending limit blocked its email (history noted once).
+  cappedAt   DateTime? @map("capped_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@index([userId, id])
+  @@index([userId, readAt])
+  @@index([emailState, userId])
+  @@index([caseId])
+  @@map("notifications")
+}
+
+/// Every alert email the hub sent or tried: the per-person (5 an hour) and
+/// per-site limits are counted from here.
+model EmailLog {
+  id        BigInt   @id @default(autoincrement())
+  /// 0 = not tied to one person.
+  userId    Int      @map("user_id")
+  /// sent, capped (the platform refused: limit), failed.
+  status    String   @db.VarChar(10)
+  items     Int
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId, createdAt])
+  @@index([createdAt])
+  @@map("email_log")
+}
+
+/// An editable pick list option (Admin → Pick lists): escalation reasons
+/// (`reason`), lost reasons (`lost_reason`), CSI problem types (`problem`).
+/// The `code` is stored on cases and never changes; the label, order and
+/// whether it is offered do. Options are switched off, never deleted.
+model PickOption {
+  id        Int      @id @default(autoincrement())
+  orgId     Int      @map("org_id")
+  list      String   @db.VarChar(16)
+  code      String   @db.VarChar(24)
+  label     String   @db.VarChar(60)
+  sortOrder Int      @default(0) @map("sort_order")
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([orgId, list, code])
+  @@index([orgId, list, sortOrder])
+  @@map("pick_options")
+}

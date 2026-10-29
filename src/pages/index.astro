@@ -1,0 +1,35 @@
+---
+/**
+ * The home page: PRERENDERED (one static file for everyone). The hub is an
+ * internal tool, so this is only the way in: sign in, or (signed in) open
+ * My Cases. Who the visitor is gets filled in by the browser (`<Base isStatic>`:
+ * `data-guest-only` / `data-user-only`), never written into this file.
+ * Words in `src/content/site.ts`.
+ */
+import {HOME} from '../content/site';
+import Base from '../layouts/Base.astro';
+import {staticContext} from '../server/page';
+
+export const prerender = true;
+
+const {site, viewer} = await staticContext(Astro.request);
+---
+
+<Base site={site} viewer={viewer} isStatic title={HOME.title} description={HOME.body}>
+  <main id="main" tabindex="-1">
+    <section class="hero">
+      <div class="wrap center">
+        <p class="eyebrow">{HOME.eyebrow}</p>
+        <h1>{HOME.title}</h1>
+        <p class="lede">{HOME.body}</p>
+        <div class="actions" data-guest-only>
+          <a class="button" href="/account/login/?next=%2Fportal" data-astro-prefetch>Sign in with your work email</a>
+        </div>
+        <div class="actions" data-user-only hidden>
+          <a class="button" href="/portal">Open My Cases</a>
+        </div>
+        <p class="muted">{HOME.help}</p>
+      </div>
+    </section>
+  </main>
+</Base>

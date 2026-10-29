@@ -1,0 +1,11 @@
+{
+  "lists": {
+    "case-clock": {"retries": 4, "concurrency": 5},
+    "hub-sweep": {"retries": 1, "concurrency": 1},
+    "alerts-summary": {"retries": 3, "concurrency": 1}
+  },
+  "schedules": {
+    "hub-sweep": {"cron": "*/5 * * * *", "label": "Case clocks and alert emails (safety sweep)"},
+    "alerts-summary": {"cron": "0 8,16 * * *", "tz": "America/New_York", "label": "8 AM and 4 PM alert summaries"}
+  }
+}
